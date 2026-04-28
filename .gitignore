@@ -1,0 +1,12 @@
+# Credentials and secrets
+.tmp/
+*.enc
+client_secret*.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Environment
+.env
