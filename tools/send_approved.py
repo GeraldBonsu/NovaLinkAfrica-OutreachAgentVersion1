@@ -1,11 +1,16 @@
 """
 Tool: send_approved.py
-Purpose: Read the Hotel Directory sheet and send emails to rows where
-         Outreach Status = "Approved to Send".
-         Uses Sheets API + Gmail API directly via requests (no gws CLI).
-SAFETY:  Will NOT send if status != "Approved to Send".
-         Will NOT send to duplicate domains in the same run.
-         Will NOT send if email field is empty.
+Purpose: Read the Master AI Growth System Leads tab and send emails to any row
+         where Status = "Approved to Send".
+
+Works for any sector (Hotels, Universities, NGOs, etc.) — sector-agnostic.
+
+SAFETY:
+  - Will NOT send if Status != "Approved to Send"
+  - Will NOT send to duplicate domains in the same run
+  - Will NOT send if Contact Email is empty
+  - Will NOT send if Email Subject or Email Body is empty
+  - After sending: sets Status -> "Sent", Last Contacted -> timestamp
 """
 
 import json, os, sys, time, base64, requests
@@ -15,37 +20,36 @@ from email.mime.multipart import MIMEMultipart
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TMP_DIR  = os.path.join(BASE_DIR, '.tmp')
+sys.path.insert(0, os.path.join(BASE_DIR, 'tools'))
+import config as cfg
 
-# appaubonsu credentials — Sheets read/write access
-CREDS_FILE         = os.path.join(TMP_DIR, 'gws_credentials.json')
-# novalinkafrica credentials — Gmail send access
-CREDS_FILE_GMAIL   = os.path.join(TMP_DIR, 'gws_credentials_novalink.json')
-SHEETS_API   = "https://sheets.googleapis.com/v4/spreadsheets"
-GMAIL_API    = "https://gmail.googleapis.com/gmail/v1/users/me"
-TOKEN_URL    = "https://oauth2.googleapis.com/token"
+SHEETS_API = "https://sheets.googleapis.com/v4/spreadsheets"
+GMAIL_API  = "https://gmail.googleapis.com/gmail/v1/users/me"
+TOKEN_URL  = "https://oauth2.googleapis.com/token"
 
-FROM_EMAIL   = "novalinkafrica@gmail.com"
-CC_EMAILS    = ["appaubonsu@gmail.com", "grindhardcircle@gmail.com"]
+# Master Sheet — Leads tab column indices (0-based)
+# Lead ID | Org Name | Country | Sector | Website |
+# Contact Name | Contact Email | LinkedIn | Lead Source | Status |
+# Lead Score | Outreach Angle | Last Contacted | Next Follow Up |
+# Notes | Date Added | Email Subject | Email Body
+COL_LEAD_ID      = 0
+COL_NAME         = 1
+COL_EMAIL        = 6
+COL_STATUS       = 9
+COL_LAST_CONTACT = 12
+COL_SUBJECT      = 16
+COL_BODY         = 17
 
-# Column indices (0-based, matching HEADERS_ROW order)
-COL_NAME    = 0
-COL_EMAIL   = 5
-COL_MSG     = 12
-COL_SUBJECT = 13
-COL_STATUS  = 14
-COL_UPDATED = 16
-COL_SENT_TS = 17
-COL_LETTER  = list("ABCDEFGHIJKLMNOPQRS")
+COL_LETTER = list("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
 
-def load_creds():
-    if not os.path.exists(CREDS_FILE):
-        print(f"ERROR: {CREDS_FILE} not found.")
-        print("Run: python tools/export_creds.py  to generate it.")
+
+def get_token(creds_file):
+    path = os.path.join(TMP_DIR, creds_file)
+    if not os.path.exists(path):
+        print(f"ERROR: {path} not found. Run: python tools/export_creds.py")
         sys.exit(1)
-    with open(CREDS_FILE) as f:
-        return json.load(f)
-
-def get_token(creds):
+    with open(path) as f:
+        creds = json.load(f)
     resp = requests.post(TOKEN_URL, data={
         "client_id":     creds["client_id"],
         "client_secret": creds["client_secret"],
@@ -54,6 +58,7 @@ def get_token(creds):
     }, timeout=15)
     resp.raise_for_status()
     return resp.json()["access_token"]
+
 
 def sheets_get(token, sid, range_):
     r = requests.get(
@@ -64,29 +69,31 @@ def sheets_get(token, sid, range_):
     r.raise_for_status()
     return r.json().get("values", [])
 
-def sheets_update(token, sid, range_, value):
+
+def sheets_update(token, sid, cell, value):
     r = requests.put(
-        f"{SHEETS_API}/{sid}/values/{requests.utils.quote(range_, safe='')}?valueInputOption=USER_ENTERED",
+        f"{SHEETS_API}/{sid}/values/{requests.utils.quote(cell, safe='')}?valueInputOption=USER_ENTERED",
         headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
         json={"values": [[value]]},
         timeout=30
     )
     r.raise_for_status()
 
-def build_mime(to, subject, body_text):
+
+def build_mime(to, subject, body_text, cc_emails):
     msg = MIMEMultipart()
-    msg["From"]    = FROM_EMAIL
+    msg["From"]    = cfg.FROM_EMAIL
     msg["To"]      = to
-    msg["Cc"]      = ", ".join(CC_EMAILS)
+    msg["Cc"]      = ", ".join(cc_emails)
     msg["Subject"] = subject
     msg.attach(MIMEText(body_text, "plain", "utf-8"))
-    raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
-    return raw
+    return base64.urlsafe_b64encode(msg.as_bytes()).decode()
 
-def send_gmail(token, raw_message):
+
+def send_gmail(gmail_token, raw_message):
     r = requests.post(
         f"{GMAIL_API}/messages/send",
-        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        headers={"Authorization": f"Bearer {gmail_token}", "Content-Type": "application/json"},
         json={"raw": raw_message},
         timeout=60
     )
@@ -94,77 +101,69 @@ def send_gmail(token, raw_message):
         raise RuntimeError(f"Gmail send failed {r.status_code}: {r.text[:200]}")
     return r.json().get("id", "")
 
+
 def main():
-    info_path = os.path.join(TMP_DIR, 'sheet_info.json')
-    if not os.path.exists(info_path):
-        print("ERROR: sheet_info.json not found. Run build_sheet.py first.")
-        sys.exit(1)
-
-    with open(info_path) as f:
-        sheet_info = json.load(f)
-    sid = sheet_info["spreadsheet_id"]
-
     print("Loading credentials...")
-    creds       = load_creds()
-    token       = get_token(creds)                          # Sheets token (appaubonsu)
+    sheets_token = get_token(cfg.CREDS_SHEETS)   # appaubonsu - Sheets read/write
+    gmail_token  = get_token(cfg.CREDS_GMAIL)    # novalinkafrica - Gmail send
 
-    gmail_creds = json.load(open(CREDS_FILE_GMAIL))
-    gmail_token = get_token(gmail_creds)                   # Gmail token (novalinkafrica)
+    sid = cfg.MASTER_SHEET_ID
+    tab = cfg.LEADS_TAB
 
-    print(f"Reading sheet: {sheet_info['url']}\n")
-    rows = sheets_get(token, sid, "Hotel Directory!A:S")
-    if not rows:
-        print("Sheet is empty.")
+    print(f"Reading: {tab} tab")
+    print(f"Sheet: https://docs.google.com/spreadsheets/d/{sid}\n")
+
+    rows = sheets_get(sheets_token, sid, f"{tab}!A:R")
+    if len(rows) <= 1:
+        print("No leads found in sheet.")
         return
 
-    headers = rows[0]
     sent_count = skipped_count = error_count = 0
     sent_domains = set()
 
     for sheet_row, row in enumerate(rows[1:], start=2):
-        while len(row) <= COL_STATUS:
+        while len(row) <= COL_BODY:
             row.append("")
 
         name    = row[COL_NAME].strip()
         email   = row[COL_EMAIL].strip()
         status  = row[COL_STATUS].strip()
-        subject = row[COL_SUBJECT].strip() if len(row) > COL_SUBJECT else ""
-        message = row[COL_MSG].strip()    if len(row) > COL_MSG     else ""
+        subject = row[COL_SUBJECT].strip()
+        body    = row[COL_BODY].strip()
+        safe    = name.encode("ascii", "replace").decode()
 
-        safe_name = name.encode('ascii', 'replace').decode()
-
-        if not email:
-            print(f"  SKIP  [{safe_name}] - no email")
+        if status != "Approved to Send":
+            print(f"  SKIP  [{safe}] - status '{status}'")
             skipped_count += 1
             continue
 
-        if status != "Approved to Send":
-            print(f"  SKIP  [{safe_name}] - status '{status}'")
+        if not email:
+            print(f"  SKIP  [{safe}] - no email")
+            skipped_count += 1
+            continue
+
+        if not subject or not body:
+            print(f"  SKIP  [{safe}] - missing Email Subject or Email Body (fill these in the sheet)")
             skipped_count += 1
             continue
 
         domain = email.split("@")[-1].lower()
         if domain in sent_domains:
-            print(f"  SKIP  [{safe_name}] - already sent to @{domain} this run")
+            print(f"  SKIP  [{safe}] - already sent to @{domain} this run")
             skipped_count += 1
             continue
 
-        if not subject or not message:
-            print(f"  SKIP  [{safe_name}] - missing subject or message")
-            skipped_count += 1
-            continue
-
-        print(f"  SEND  [{safe_name}] -> {email}")
+        print(f"  SEND  [{safe}] -> {email}")
         try:
-            raw = build_mime(email, subject, message)
+            raw    = build_mime(email, subject, body, cfg.CC_EMAILS)
             msg_id = send_gmail(gmail_token, raw)
             sent_domains.add(domain)
             sent_count += 1
 
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            sheets_update(token, sid, f"Hotel Directory!{COL_LETTER[COL_STATUS]}{sheet_row}",  "Sent")
-            sheets_update(token, sid, f"Hotel Directory!{COL_LETTER[COL_SENT_TS]}{sheet_row}", timestamp)
-            sheets_update(token, sid, f"Hotel Directory!{COL_LETTER[COL_UPDATED]}{sheet_row}", timestamp)
+            tab_cell  = lambda col: f"{tab}!{COL_LETTER[col]}{sheet_row}"
+            sheets_update(sheets_token, sid, tab_cell(COL_STATUS),       "Sent")
+            sheets_update(sheets_token, sid, tab_cell(COL_LAST_CONTACT), timestamp)
             print(f"        + Sent (msg_id: {msg_id}) at {timestamp}")
             time.sleep(2)
 
@@ -176,6 +175,7 @@ def main():
     print(f"  Sent:    {sent_count}")
     print(f"  Skipped: {skipped_count}")
     print(f"  Errors:  {error_count}")
+
 
 if __name__ == "__main__":
     main()

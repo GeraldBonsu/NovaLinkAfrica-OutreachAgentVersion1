@@ -38,7 +38,7 @@ LEADS_COLUMNS = [
     "Lead ID", "Organisation Name", "Country", "Sector", "Website",
     "Contact Name", "Contact Email", "LinkedIn", "Lead Source", "Status",
     "Lead Score", "Outreach Angle", "Last Contacted", "Next Follow Up",
-    "Notes", "Date Added"
+    "Notes", "Date Added", "Email Subject", "Email Body"
 ]
 COL = {name: i for i, name in enumerate(LEADS_COLUMNS)}
 
@@ -258,12 +258,14 @@ def main():
             (lead.get("linkedin") or "").strip(),               # LinkedIn
             (lead.get("lead_source") or "Web Search").strip(),  # Lead Source
             status,                                             # Status
-            "",                                                 # Lead Score (blank)
-            "",                                                 # Outreach Angle (blank)
+            "",                                                 # Lead Score (blank — fill via scoring step)
+            "",                                                 # Outreach Angle (blank — fill before sending)
             "",                                                 # Last Contacted (blank)
             "",                                                 # Next Follow Up (blank)
             notes,                                              # Notes
             today,                                              # Date Added
+            "",                                                 # Email Subject (blank — fill before sending)
+            "",                                                 # Email Body (blank — fill before sending)
         ]
         new_rows.append(row)
 
